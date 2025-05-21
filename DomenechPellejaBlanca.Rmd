@@ -1,0 +1,597 @@
+---
+title: "Anàlisi de les reserves d'hotel"
+author: "Blanca Domènech"
+date: "April 2025"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Càrrega paquets
+
+```{r packages}
+library("ggmosaic")
+library("ggplot2")
+library("fitdistrplus")
+library("MASS")
+library("survival")
+library("ggstatsplot")
+library("tidyverse")
+```
+
+# 2. Càrrega de dades i dimensió
+
+We read the dataset in CSV format, with 119,390 rows y 32 columns:
+
+```{r load data}
+x=read.csv("hotel_bookings.csv", stringsAsFactors = T)
+# Registres inicials
+n_inicial = nrow(x)
+
+# Es guarda una còpia de les dades originals
+df_source = x
+dim(x)
+```
+
+# 3. Neteja de les dades
+
+Primer s'inspecciona les dades utilitzant la funció `summary()` d'R per tenir una visió general.
+
+```{r summary, echo=FALSE}
+summary(x)
+```
+
+```{r}
+# Variables amb NAs
+colSums(is.na(x))[colSums(is.na(x)) > 0]
+```
+
+## 3.1. Variables numèriques
+
+S'observen valors inesperats en aglunes variables. Per exemple:
+
+1) Un màxim de 55 adults per reserva
+2) Un màxim de 10 'children'(també valors faltants)
+3) Un màxim de 10 'babies'
+4) Valors negatius en  average daily rate ('adr') or or very high
+
+### Variable adults
+Es visualitza en un histograma la variable adults.
+
+```{r hist_adults}
+hist(x$adults)
+```
+
+Es pot observar que l'histograma no mostra cap barra al voltant del valor 55, atès que es tracta d’un conjunt molt gran i probablement només hi ha un o pocs casos. En aquests casos, per analitzar els valors extrems d’una variable, es poden representar gràficament els valors de la variable en qüestió de la manera següent, ordenant i representant les dades (si són numèriques, com en aquest cas):
+
+```{r plot_adults}
+plot(sort(x$adults))
+grid()
+```
+L’‘Índex’ representa la posició de l’element un cop està ordenat, però ens
+interessa més l’eix Y, ja que podem veure que alguns elements tenen valors
+de 10 o més. Com que es tracta d’una variable sencera amb un conjunt limitat
+de valors possibles, podem utilitzar table() per visualitzar-los:
+
+```{r table_adults}
+table(x$adults)
+```
+
+Com podeu veure, hi ha una reserva per a 10 adults, dues per a 20 adults, i així successivament, fins a una per a 55 adults! Sense entrar en més detalls, eliminarem totes les files amb reserves per a 10 o més adults:
+
+```{r clean_adults}
+x=x[x$adults<10,]
+```
+
+### Variable children i babies
+
+Hi ha una reserva amb 10 nens. Donat que és un únic registre i s'observa que normalment va de 0 a 3, s'elimina aquest cas.
+
+```{r plot_adults}
+table(x$children, x$babies)
+x=x[x$children<10 & x$babies<10,]
+```
+
+Es vol mirar si hi ha estades on no hi ha adults i hi ha children i babies. 
+
+- Babies: de 0 a 2 anys
+- Children: de 3 a 12 anys
+- Adult: 13 anys en endavant
+
+```{r}
+x <- x %>%
+  filter(!(adults == 0 & (children > 0 | babies > 0)))
+dim(x)
+```
+
+### Variable average daily rate
+
+L’histograma de la variable adr (tarifa mitjana diària) presenta el mateix problema que la variable adults, així que simplement tornarem a crear un gràfic amb els valors ordenats:
+
+```{r plot_adr}
+plot(sort(x$adr))
+grid()
+```
+En aquest cas s'observa que nomes hi ha un valor significativament major que la resta. Es considera aquest com un outlier i s'elimina, com també els valors negatius. El valor 0 de moment es conserva.
+
+```{r clean_adr}
+x=x[x$adr>=0 & x$adr<1000,]
+```
+
+A continuació es realitza l'histograma de la variable `adr`.
+
+```{r hist_adr}
+ggplot(data=x, aes(x=adr)) + 
+  geom_histogram(bins=55, colour="black", fill = "lightgray") +
+  theme_light()
+```
+
+
+Es decideix:
+
+1) Eliminar les reserves amb 0 dies d'estada
+2) Eliminar les estades de cost 0
+3) Eliminar les estades que no tenen cap tipus d'hote
+4) Es subsitueixen els NAs dels `children` per 0
+
+```{r data_cleansing}
+# Eliminar registres inconsistents
+x=x[x$adr>0 & 
+    (x$stays_in_week_nights + x$stays_in_weekend_nights) > 0 & # Estades de 0 dies
+    (x$adults+x$children+x$babies)>0,]                       # 0 clients
+
+# Substituir NAs per 0
+x[is.na(x$children), 'children']=0
+```
+
+
+## 3.2.Variables categòriques
+
+### Categira d'hoste
+També s'aplica una transformació segons la categoria dels hostes i el nombre:
+```{r}
+x <- x %>%
+  mutate(
+    # Tipus de grup
+    host_type = case_when(
+      adults == 1 & children == 0 & babies == 0 ~ "Només adult",
+      adults == 2 & children == 0 & babies == 0 ~ "Parella",
+      adults >= 1 & (children >= 1 | babies >= 1) ~ "Família amb nens",
+      adults >= 3 & children == 0 & babies == 0 ~ "Grup d'adults",
+      adults >= 1 & (children >= 1 | babies >= 1) & adults + children + babies > 3 ~ "Grup mixt",
+      adults == 0 & (children + babies) > 0 ~ "Només children/babies",
+      TRUE ~ "Altres"
+    )
+  )
+```
+
+
+
+### País
+Donat que hi ha 178 valors diferents de país, es crea una nova categorització amb: Portugal (ja que té un comportament en sí mateix i hi ha suficients registres), Europa, Amèrica, Asia, Africa, Oceania, Terrotiros especials o regions especials
+
+```{r}
+# Variable entre nacional i internacional
+x$country_prt_internacional <- ifelse(x$country == "PRT", "Portugal", "Internacional")
+
+# Variable geogràfica
+x$country_group <- case_when(
+  x$country == "PRT" ~ "Portugal",
+  
+  # Europa
+  x$country %in% c("ESP", "FRA", "DEU", "ITA", "GBR", "NLD", "BEL", "IRL", "SWE", "NOR", "POL",
+                     "ALB", "AND", "AUT", "BLR", "BGR", "BIH", "CHE", "CYP", "CZE", "DNK", "EST", 
+                     "FIN", "FRO", "GEO", "GGY", "GIB", "GRC", "HRV", "HUN", "IMN", "ISL", "JEY",
+                     "LIE", "LTU", "LUX", "LVA", "MCO", "MKD", "MLT", "MNE", "ROU", "RUS", "SMR", 
+                     "SRB", "SVK", "SVN", "UKR", "VAT") ~ "Europa",
+  
+  # Amèrica
+  x$country %in% c("USA", "CAN", "MEX", "BRA", "ARG", "COL", "CHL",
+                     "ABW", "AIA", "ATG", "BHS", "BLZ", "BMU", "BOL", "BRB", "CRI", 
+                     "CUB", "CYM", "DMA", "DOM", "ECU", "GLP", "GTM", "GUY", "HND", 
+                     "HTI", "JAM", "KNA", "LCA", "NIC", "PAN", "PER", "PRI", "PRY", 
+                     "SLV", "SUR", "TTO", "URY", "VEN", "VGB") ~ "Amèrica",
+  
+  # Àsia
+  x$country %in% c("CHN", "CN", "JPN", "IND", "SGP", "THA", "KOR", "HKG",
+                     "ARE", "ARM", "AZE", "BHR", "BGD", "BRN", "BTN", "IDN", "IRN", 
+                     "IRQ", "ISR", "JOR", "KAZ", "KGZ", "KHM", "KWT", "LAO", "LBN", 
+                     "LKA", "MAC", "MDV", "MMR", "MNG", "MYS", "NPL", "OMN", "PAK", 
+                     "PHL", "PRK", "PSE", "QAT", "SAU", "SYR", "TJK", "TMP", "TUR", 
+                     "TWN", "UZB", "VNM", "YEM") ~ "Àsia",
+  
+  # Àfrica
+  x$country %in% c("ZAF", "MAR", "EGY", "KEN", "NGA",
+                     "AGO", "BDI", "BEN", "BFA", "BWA", "CAF", "CIV", "CMR", "COM", 
+                     "CPV", "DJI", "DZA", "ETH", "GAB", "GHA", "GIN", "GMB", "GNB", 
+                     "GNQ", "LBY", "LSO", "MDG", "MLI", "MOZ", "MRT", "MUS", "MWI", 
+                     "MYT", "NAM", "NER", "REU", "RWA", "SDN", "SEN", "SLE", "SOM", 
+                     "SSD", "STP", "SYC", "TCD", "TGO", "TUN", "TZA", "UGA", "ZMB", 
+                     "ZWE") ~ "Àfrica",
+  
+  # Oceania
+  x$country %in% c("AUS", "NZL", "FJI",
+                     "ASM", "COK", "FSM", "GUM", "KIR", "MHL", "NCL", "PLW", "PNG", 
+                     "PYF", "SLB", "TON", "TUV", "VUT", "WSM") ~ "Oceania",
+  
+  # Territoris especials o regions polars
+  x$country %in% c("ATA", "ATF", "UMI") ~ "Territoris especials",
+  
+  # No informat
+  is.na(x$country) | x$country == "NULL" ~ "No informat"
+)
+```
+
+Donat que hi ha països que no arriben a les 100 reserves, es crea una columna per identificar aquesta informació. També es crea un nou conjunt de dades per analitzar la informació sense els països amb menys de 100 reserves.
+
+```{r country}
+# Es crea columna a x on diu el nombre de visites per country
+x = x %>% group_by(country) %>% mutate(pais=n()) %>% ungroup()
+
+# countries with at least 1000 bookings (new dataset xx)
+xx = x %>% group_by(country) %>% mutate(pais=n()) %>% filter(pais>=1000)
+xx$country=factor(xx$country)
+ggplot(data=xx, aes(x=reorder(country, -pais))) + 
+  geom_bar(stat="count", aes(fill=hotel)) +
+  theme_light() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+
+
+A continuació es mostra la diferència en la tipologia d'hotel i les seves reserves segons el país d'origen de la reserva.
+
+```{r}
+ggplot(xx, aes(x=country_prt_internacional, fill=hotel)) + 
+  geom_bar(position="dodge") +
+  labs(x="Guest Origin", y="Number of Bookings", fill="Hotel Type",
+       title="Comparison of Bookings: Portugal vs Other Countries") +
+  theme_minimal()
+```
+
+### Reserva cancel·lada
+
+Una altra variable interessant és is_canceled, que indica si una reserva ha estat cancel·lada o no (el 37,0% de les vegades).
+
+Podem observar la relació entre dues variables categòriques mitjançant un gràfic de mosaic:
+
+```{r mosaic_hotel_is_canceled}
+# require(ggmosaic)
+x$is_canceled=as.factor(x$is_canceled)
+ggplot(data=x) + 
+  geom_mosaic(aes(x=product(is_canceled, hotel), fill=hotel)) +
+  theme_light() 
+```
+Es pot veure que la taxa de cancel·lació (indicada amb un 1 a l’eix Y) en un complex turístic és inferior a la d’un hotel a Lisboa. A l’eix X, la mida relativa de cada columna també correspon a la proporció de cada tipus d’hotel.
+
+És important no considerar les etiquetes de l’eix Y (0/1) com si fossin la taxa de cancel·lació numèrica real, ja que això podria portar a confusions.
+El següent gràfic no té en compte el nombre de reserves i es compara el percentatge de cancel·lació segons la tipologia d'hotel.
+
+```{r}
+ggplot(xx, aes(x=hotel, fill=factor(is_canceled))) +
+  geom_bar(position="fill") +  # shows proportions (100% stacked bar)
+  scale_y_continuous(labels = scales::percent) +
+  labs(title="Proportion of Cancellations by Hotel Type",
+       x="Hotel Type", y="Proportion", fill="Cancelled") +
+  theme_minimal()
+```
+
+
+En el cas de les cancel·lacions per país, per als països amb més turistes:
+
+```{r mosaic_country_is_canceled}
+# Almenys 1000 reserves
+xx = x %>% group_by(country) %>% mutate(pais=n()) %>% filter(pais>=1000)
+
+xx$country=factor(xx$country)
+ggplot(data=xx) + 
+  geom_mosaic(aes(x=product(is_canceled, country), fill=country)) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+Es pot veure que la taxa de cancel·lació és molt més alta per als turistes locals (de Portugal, PRT), mentre que és molt més baixa per a la resta de països. Tot i això, aquest gràfic no és fàcil de llegir; en aquest cas, no hi ha un ordre ni dels països ni del percentatge de cancel·lacions.
+
+
+A continuació es mostra el percentatge de cancel·lació segons el país (tenint en compte que els països amb més de 1000 reserves).
+
+```{r}
+cancel_rate <- xx %>%
+  group_by(country) %>%
+  summarise(cancel_pct = mean(is_canceled == 1)) %>%
+  arrange(desc(cancel_pct))
+
+ggplot(xx, aes(x=factor(country, levels = cancel_rate$country), fill=factor(is_canceled))) +
+  geom_bar(position="fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title="Percentatge de cancel·lació per país",
+       x="Country", y="Proportion", fill="Cancelled") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+
+```
+
+EXERCISE: You must explore such enriched dataset and, in this process of 
+exploration, decide what story you want to tell about it. Some ideas:
+
+1) do tourists from different countries travel in different dates?
+```{r}
+xx <- xx %>%
+  mutate(arrival_date = dmy(paste(arrival_date_day_of_month, arrival_date_month, arrival_date_year)))
+
+
+top_countries <- xx %>%
+  count(country, sort = TRUE) %>%
+  head(5) %>% 
+  pull(country)
+
+ggplot(xx %>% filter(country %in% top_countries), 
+       aes(x = arrival_date, fill = country)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Arrival Date Density by Country",
+       x = "Arrival Date", y = "Density") +
+  theme_minimal()
+
+```
+```{r}
+xx <- xx %>%
+  mutate(arrival_month = month(arrival_date, label = TRUE, abbr = TRUE))  # e.g. "Jan", "Feb", ...
+
+ggplot(xx %>% filter(country %in% top_countries), 
+       aes(x = arrival_month, fill = country)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Relative Booking Patterns by Country Across Months",
+       x = "Arrival Month", y = "Proportion", fill = "Country") +
+  theme_minimal()
+
+```
+
+
+# 4. Anàlisis enfocat en el % de cancel·lació
+
+
+## 4.1. Dies restants per a l'estada (lead time)
+
+```{r}
+# Es crea una variable més entenedora per a l'humà
+x$lead_time_cat <- cut(
+  x$lead_time, breaks = c(-1, 0, 15, 30, 180, 365, Inf),
+  labels = c(
+    "Mateix dia",
+    "1-15 dies",
+    "15 dies - 1 mes",
+    "1-6 mesos",
+    "6 mesos - 1 any",
+    "Més d'un any"
+  ),
+  right = TRUE
+)
+
+
+df_lead_time <- x %>% 
+  group_by(lead_time_cat) %>%
+  summarise(
+    total = n(),
+    canceled = sum(is_canceled == 1),
+    pct_canceled = round(100 * canceled / total, 1)
+  )
+
+ggplot(df_lead_time, aes(x = lead_time_cat, y = pct_canceled)) +
+  geom_col(fill = "tomato") +
+  labs(title = "% de cancelació segons dies restants per a l'estada",
+       x = "Dies restants",
+       y = "% cancel·lació") +
+  theme_minimal()
+```
+S'observa que hi ha una clara tendència en el percentatge de cancel·lació segons els dies restants de l'estada.
+
+```{r}
+df_lead_time
+```
+
+## 4.2. Dies restants per a l'estada (lead time) i hotel
+
+```{r}
+df_lead_time_hotel <- x %>%
+  group_by(lead_time_cat, hotel) %>%
+  summarise(
+    total_reserves = n(),
+    cancelades = sum(is_canceled == 1),
+    pct_cancel = round(100 * cancelades / total_reserves, 1)
+  ) %>% 
+  mutate(
+    pct_no_cancel = 100 - pct_cancel
+  ) %>% 
+  select(lead_time_cat, hotel, pct_cancel, pct_no_cancel)
+
+
+ggplot(df_lead_time_hotel, aes(x = lead_time_cat, y = pct_cancel, fill = hotel)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(
+    title = "% cancel·lació segons dies restants i tipus d'hotel",
+    x = "Temps restant",
+    y = "% cancel·lació",
+    fill = "Hotel"
+  ) +
+  theme_minimal()
+
+```
+
+Independentment de l'hotel, el % de cancel·lació ve marcat pel nombre de dies restants a la reserva.
+
+
+## 4.3. Nombre de canvis en la reserva
+
+```{r}
+df_changes <- x %>% 
+  # Agrupar valors grans de 'booking_changes' en una sola categoria
+  mutate(
+    booking_grouped = if_else(booking_changes > 6, 5L, booking_changes)
+  ) %>%
+  # Calcular totals i percentatges de cancel·lació per grup
+  group_by(booking_grouped) %>%
+  summarise(
+    pct_canceled = round(100 * mean(is_canceled == 1), 0),
+    .groups = "drop"
+  ) %>%
+  # Afegir percentatge de no cancel·lació
+  mutate(
+    pct_no_canceled = 100 - pct_canceled
+  ) %>%
+  # Passar les columnes a format llarg per fer gràfics més fàcilment
+  pivot_longer(
+    cols = starts_with("pct_"),
+    names_to = "estat",
+    values_to = "pct"
+  ) %>%
+  # Reetiquetar per fer-ho més llegible al gràfic
+  mutate(
+    estat = recode(estat,
+                   pct_canceled = "Cancel",
+                   pct_no_canceled = "No cancel")
+  )
+
+ggplot(df_changes, aes(x = booking_grouped, y = pct, fill = estat)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(
+    title = "% cancel·lació segons nombre de canvis",
+    x = "Nombre de canvis",
+    y = "% cancel·lació",
+    fill = "Hotel"
+  ) +
+  theme_minimal()
+```
+
+
+## 4.4. Requeriments en la reserva
+
+
+```{r}
+df_requeriments <- x %>% 
+  mutate(
+    special_requests_grouped = case_when(
+      total_of_special_requests %in% 4:5 ~ 4,  # Unir 4 i 5 en una nova categoria "4"
+      TRUE ~ total_of_special_requests     # Deixar la resta igual
+    )
+  ) %>%
+  group_by(special_requests_grouped) %>%
+  summarise(
+    total = n(),
+    canceled = sum(is_canceled == 1),
+    pct_canceled = round(100 * canceled / total, 0)
+  ) %>% 
+  mutate(
+    pct_no_canceled = 100 - pct_canceled
+  ) %>% 
+  pivot_longer(
+    cols = c(pct_canceled, pct_no_canceled),
+    names_to = "estat",
+    values_to = "pct"
+  ) %>%
+  # Reetiquetar per fer-ho més llegible al gràfic
+  mutate(
+    estat = recode(estat,
+                   pct_canceled = "Cancel",
+                   pct_no_canceled = "No cancel")
+  ) 
+
+
+ggplot(df_requeriments, aes(x = special_requests_grouped, y = pct)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(
+    title = "% cancel·lació segons nombre de requeriments",
+    x = "Requeriments",
+    y = "% cancel·lació"
+  ) +
+  theme_minimal()
+```
+
+
+## 4.5. Clients nous/habituals
+
+```{r}
+df_client_nou <- x %>% 
+  mutate(
+    client = ifelse(previous_bookings_not_canceled >= 1, "Client habitual", "Client nou")
+  ) %>% 
+  group_by(client) %>%
+  summarise(
+    total = n(),
+    canceled = sum(is_canceled == 1),
+    pct_canceled = round(100 * canceled / total, 1)
+  )
+
+df_client_nou
+```
+
+## 4.6. Cancel·lació per regió
+
+```{r}
+# Definir l'ordre desitjat
+ordre_proximitat <- c("Portugal", "Europa", "Àfrica", "Amèrica", "Àsia", "Oceania")
+
+# Ens quedem amb els països amb més de 1000 reserves
+df_country_100 <- x %>%
+  filter(pais > 100, country_group != "No informat") %>% 
+  select(country_group, is_canceled) %>% 
+  mutate(
+    is_canceled = ifelse(as.numeric(is_canceled) == 1, "Cancel", "No cancel")
+  ) %>%
+  group_by(country_group, is_canceled) %>%
+  summarise(total = n(), .groups = "drop") %>% 
+  group_by(country_group) %>%
+  mutate(
+    raw_pct = total / sum(total) * 100,
+    pct = round(raw_pct, 1)
+  ) %>%
+  # Ajustar per assegurar-se que la suma és 100
+  mutate(
+    diff = 100 - sum(pct),
+    pct = if_else(row_number() == n(), pct + diff, pct)
+  ) %>%
+  select(-raw_pct, -diff) %>% 
+  mutate(country_group = factor(country_group, levels = ordre_proximitat)) %>%
+  arrange(country_group)
+
+ggplot(df_country_100, aes(x = country_group, y = pct, fill = is_canceled)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(
+    title = "% cancel·lació segons regió d'origen",
+    x = "Regió",
+    y = "%",
+    fill = "Cancel/no cancel"
+  ) +
+  theme_minimal()
+```
+## 4.7. Top 10 país
+
+```{r}
+# Calcular top 10 amb més reserves
+top_countries <- x %>%
+  count(country, sort = TRUE) %>%
+  top_n(10, n) %>%
+  pull(country)
+
+# Calcular %
+cancel_percent <- x %>%
+  filter(country %in% top_countries) %>%
+  group_by(country) %>%
+  summarise(
+    total = n(),
+    pct_cancel = 100 * sum(is_canceled) / total
+  ) %>%
+  arrange(desc(pct_cancel))
+
+# Graficar
+ggplot(cancel_percent, aes(x = reorder(country, -pct_cancel), y = pct_cancel)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  labs(title = "% cancel·lacions en els top 10 països de reserves",
+       x = "País",
+       y = "% cancel·lació") +
+  theme_minimal()
+```
+
+
