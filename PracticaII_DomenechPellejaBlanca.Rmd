@@ -1,0 +1,555 @@
+---
+title: 'Pràctica II: Visualització de dades'
+author: "Blanca Domènech Pellejà"
+date: '10 de juny de 2025'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries, include=FALSE}
+library(knitr)
+library(kableExtra)
+library(stringr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(openxlsx)
+```
+
+
+# 1. Càrrega de dades
+
+```{r}
+df_titulars_source <- read_csv("data/01-titulars.csv", show_col_types = FALSE)
+df_viatges_source <- read_csv("data/03-viatges.csv", show_col_types = FALSE)
+```
+
+
+# 2. Processament titulars
+
+```{r}
+df_titulars <- df_titulars_source %>% 
+  select(`Primer cognom`, `Segon cognom`, `Nom`, `Sexe`, `Tipus de càrrec`, 
+         `Nomenclatura del càrrec`, `Data inici de l'ocupació`, `Data fi de l'ocupació`) %>% 
+  rename(
+    cognom1 = `Primer cognom`,
+    cognom2 = `Segon cognom`,
+    nom = `Nom`,
+    sexe = `Sexe`,
+    tipus_carrec = `Tipus de càrrec`,
+    nomenclatura_carrec = `Nomenclatura del càrrec`,
+    data_inici = `Data inici de l'ocupació`,
+    data_fi = `Data fi de l'ocupació`
+  ) %>% 
+  mutate(
+    data_inici = dmy(data_inici),
+    data_fi = dmy(data_fi),
+    durada_anys = time_length(interval(data_inici, data_fi), unit = "year")
+  )
+```
+
+## 2.1. Estandardització departaments
+
+S'estandarditzen els departaments a partir dels departaments que existeixen en la última legislatura. Per a fer-ho, s'ha extret un registre dels noms dels departaments únics, i se'ha assignat el departament que més s'aproxima.
+```{r}
+df_dep_revisio <- read.xlsx("data/05-df_departament_revisio.xlsx")
+df_dep_actuals <- read_csv("data/04-departaments.csv", show_col_types = FALSE)
+
+df_titulars <- df_titulars %>% 
+  left_join(df_dep_revisio, by = "nomenclatura_carrec") %>% 
+  left_join(df_dep_actuals, by = c("codi_departament" = "Codi")) %>% 
+  select(-nomenclatura_carrec, -id) %>%
+  rename(nom_departament = Nom)
+```
+
+
+## 2.2. Assignació any naixement i id_persona
+
+S'ha vist que hi ha persones que han estat més d'una veaga en el govern de la Generalitat de Catalunya, però que han escrit el nom diferent (sense accent, nom complet, etc.). S'ha corregit aquesta informació i s'ha buscat l'any de naixament per a cadascú.
+
+```{r}
+df_nom_any <- read.xlsx("data/06-df_titulars_unics.xlsx")
+
+df_titulars <- df_titulars %>% 
+  left_join(df_nom_any %>%  select(nom, cognom1, cognom2, any_naix, id_persona), by = c("nom", "cognom1", "cognom2"))
+```
+
+## 2.3. Estandardtizació del nom de la persona
+
+```{r}
+# Nom únic per a cada id_persona
+df_noms_correctes <- df_titulars %>%
+  arrange(id_persona, nom, cognom1, cognom2) %>%
+  group_by(id_persona) %>%
+  summarise(
+    nom_correcte = first(nom),
+    cognom1_correcte = first(cognom1),
+    cognom2_correcte = first(cognom2),
+    .groups = "drop"
+  )
+
+
+# Es substitueixen els noms per una única versió
+df_titulars <- df_titulars %>%
+  left_join(df_noms_correctes, by = "id_persona") %>%
+  mutate(
+    nom = nom_correcte,
+    cognom1 = cognom1_correcte,
+    cognom2 = cognom2_correcte
+  ) %>%
+  select(-nom_correcte, -cognom1_correcte, -cognom2_correcte)
+
+```
+
+## 2.4. Partit polític i ideologia del titular
+
+S'ha assginat el partit el qual ha estat més temps la persona, per facilitar l'anàlisi de dades, ja que sovint hi ha canvis de molts noms però la ideologia política és similar. També s'assigna una escala d'esquerra-dreta per usar en l'anàlisi.
+
+S'ha utilitzat els codis que utilitza el Centre d'Estudis d'Opinió en el Baròmetre d'Opinió Política (BOP) per assignar el partit a cada persona.
+
+```{r}
+df_pp_persona <- read.xlsx("data/07-df_partitpolitic.xlsx", sheet = "pp_persona")
+df_pp_dim <- read.xlsx("data/07-df_partitpolitic.xlsx", sheet = "id_partit_politic")
+
+# df_pp_persona <- df_pp_persona %>%
+#   arrange(id_persona, data_inici) %>%
+#   group_by(id_persona) %>%
+#   slice(1) %>%                        
+#   select(id_persona, id_partit_politic)
+# 
+# 
+# 
+# df_titulars <- df_titulars %>%
+#   left_join(df_pp_persona, by = "id_persona") %>% 
+#   left_join(df_pp_dim, by = "id_partit_politic")
+```
+
+## 2.5. Transformació: titulars únics
+
+Es crea una conjunt de dades on hi ha hagi registres únics dels titulars, que s'agruparà per nom i cognoms, es fa un recompte del nombre de vegades que han tingut un alt càrrec i la durada total.
+
+```{r}
+df_titulars_unics <- df_titulars %>%
+  group_by(id_persona, nom, cognom1, cognom2) %>%
+  summarise(
+    durada_total_anys = sum(durada_anys, na.rm = TRUE),
+    num_carrecs = n(),
+    .groups = "drop"
+  )
+```
+
+
+# 3. Viatges
+
+Es canvia el nom de columnes, s'arregla un valor erròni identificat i es calcula la durada del viatge.
+
+```{r}
+df_viatges <- df_viatges_source
+
+# Canvi noms variable
+colnames(df_viatges) <- c("id", "nom_departament", "unitat_organica", "nom_cognoms", "carrec",
+                          "data_inici_v", "data_fi_v", "destinacio", "motiu", "agenda", "comitiva",
+                          "des_dietes_manutencio", "des_allotjament", "des_transport", "des_altres",
+                          "total_despeses", "nom_altres_despeses", "observacions")
+
+# Es detecta un error
+df_viatges$data_fi_v[df_viatges$id == "racc-950"] <- "12/05/2023"
+
+# Es crea la variable de durada viatge
+df_viatges$data_inici_v <- as.Date(df_viatges$data_inici_v, format = "%d/%m/%Y")
+df_viatges$data_fi_v <- as.Date(df_viatges$data_fi_v, format = "%d/%m/%Y")
+df_viatges$durada_viatge <- as.numeric(df_viatges$data_fi_v - df_viatges$data_inici_v) + 1
+  
+```
+
+
+## 3.1. Tractament noms i sexe
+
+Es passa tot en minúscules, se subtitueix el lligam amb i entre els dos cognoms i es treuen accents per unir per persones úniques.
+
+```{r}
+df_viatges <- df_viatges %>%
+  mutate(nom_cognoms = nom_cognoms %>%
+           str_to_lower() %>%
+           str_replace_all(" i ", " ") %>%
+           str_replace_all("à", "a") %>%
+           str_replace_all("á", "a") %>%
+           str_replace_all("è", "e") %>%
+           str_replace_all("é", "e") %>%
+           str_replace_all("í", "i") %>%
+           str_replace_all("ï", "i") %>%
+           str_replace_all("ò", "o") %>%
+           str_replace_all("ó", "o") %>%
+           str_replace_all("ú", "u") %>%
+           str_replace_all("ü", "u"))
+```
+
+Persones del viatge uniques:
+
+```{r}
+df_prs_viatges <- df_viatges %>%
+  group_by(nom_cognoms) %>%
+  summarise(
+    num_viatges = n(),
+    .groups = "drop"
+  )
+```
+
+
+Es carreguen les dades que s'han buscat sobre any de naixement i sexe.
+```{r}
+df_any_sexe_viatges <- read.xlsx("data/08-df_prs_viatges.xlsx")
+
+df_viatges <- df_viatges %>% 
+  left_join(df_any_sexe_viatges, by = "nom_cognoms") %>% 
+  mutate(nom_cognoms = ifelse(!is.na(nom_cognoms_corregit), 
+                              nom_cognoms_corregit, nom_cognoms)) %>%
+  select(-nom_cognoms_corregit) 
+```
+
+
+## 3.2. Destinació (ciutat/país)
+
+El camp està compost pel nom de la ciutat i entre parèntesis el país. Es fa una extracció d'aquesta informacio per tenir la ciutat per una banda i el país per una altra. Donat que hi ha gent que va a més d'un lloc per viatge, acostuma a ser al mateix país. Per això, en els casos que hi hagi dues destinacions, es té en compte la primera.
+
+```{r}
+df_viatges <- df_viatges %>%
+  mutate(destinacio = destinacio %>%
+           str_to_lower() %>%
+           str_replace_all(" i ", " ") %>%
+           str_replace_all("à", "a") %>%
+           str_replace_all("á", "a") %>%
+           str_replace_all("è", "e") %>%
+           str_replace_all("é", "e") %>%
+           str_replace_all("í", "i") %>%
+           str_replace_all("ï", "i") %>%
+           str_replace_all("ò", "o") %>%
+           str_replace_all("ó", "o") %>%
+           str_replace_all("ú", "u") %>%
+           str_replace_all("ü", "u"))
+
+# Extreure la primera ciutat (tot abans del primer parèntesi)
+df_viatges$ciutat <- str_extract(df_viatges$destinacio, "^[^(]+")
+df_viatges$ciutat <- str_trim(df_viatges$ciutat)  # Eliminar espais al principi i final
+
+# Extreure el primer país (contingut del primer parèntesi)
+df_viatges$pais <- str_extract(df_viatges$destinacio, "\\(([^)]+)\\)")
+df_viatges$pais <- str_remove_all(df_viatges$pais, "[()]")  # Eliminar parèntesis
+```
+
+
+Estandardització del país:
+```{r}
+df_viatges <- df_viatges %>%
+  mutate(pais = pais %>%
+    str_to_lower() %>%
+    str_trim() %>%
+    str_replace_all("estats units.*|eua|eeuu", "estats units") %>%
+    str_replace_all("gran bretanya|regne unit", "regne unit") %>%
+    str_replace_all("marroc, el|marrroc", "marroc") %>%
+    str_replace_all("kenia", "kenya") %>%
+    str_replace_all("rumania", "romania") %>%
+    str_replace_all("sardenya, italia", "italia") %>%
+    str_replace_all("hong kong, xina", "hong kong") %>%
+    str_replace_all("holanda", "paisos baixos") %>%
+    str_replace_all("emirats arabs units, els", "emirats arabs units") %>% 
+    str_replace_all("malaisia", "malasia") %>% 
+    str_replace_all("republica txeca", "txequia") %>% 
+    str_replace_all("brusel·les", "belgica") %>% 
+    str_replace_all("brusel.les", "belgica") %>% 
+    str_replace_all("bruselles", "belgica")
+      
+  )
+```
+
+S'ha assignat manualment els casos que el codi no ha extret cap pais. Això es deu a que les dades no estan ben entrades
+```{r}
+df_clean_pais <- read.xlsx("data/09-clean_pais.xlsx")
+
+df_viatges <- df_viatges %>% 
+  left_join(df_clean_pais, by = "id") %>% 
+  mutate(pais = ifelse(!is.na(pais), 
+                              pais, pais_clean)) %>%
+  select(-pais_clean, -ciutat_result, -num_viatges)
+```
+
+## 3.3. Estandardització departaments
+
+S'estandarditzen els noms dels departaments a partir del que hi ha actualment
+
+```{r}
+df_clean_departament <- df_viatges %>%
+  distinct(nom_departament) %>%
+  arrange(nom_departament) %>%  #
+  mutate(id_departament = row_number())
+
+df_viatges <- df_viatges %>%
+  left_join(df_clean_departament, by = "nom_departament")
+
+# Assignats manualment
+df_clean_departament <- read.xlsx("data/10-clean_departament.xlsx")
+df_clean_departament <- df_clean_departament %>% 
+  select(id_departament, id_departament_3)
+
+# Nom oficial:
+df_dep_actuals_rev <- df_dep_actuals %>% 
+  mutate(
+    id_departament_3 = Codi,
+    nom_oficial_departament = Nom
+  ) %>% 
+  select(-id, -Codi, -Nom)
+
+df_viatges <- df_viatges %>% 
+  left_join(df_clean_departament, by = "id_departament") %>% 
+  left_join(df_dep_actuals_rev, by = "id_departament_3")
+
+```
+
+
+## 3.5. Tractament despeses
+
+Ens quedem amb les despeses que son majors de 0. Així l'univers és viatges amb despeses per part de la generalitat.
+
+```{r}
+df_viatges <- df_viatges %>% 
+  mutate(
+    des_dietes_manutencio = ifelse(is.na(des_dietes_manutencio), 0, des_dietes_manutencio),
+    des_allotjament = ifelse(is.na(des_allotjament), 0, des_allotjament),
+    des_transport = ifelse(is.na(des_transport), 0, des_transport),
+    des_altres = ifelse(is.na(des_altres), 0, des_altres),
+    total_despeses = ifelse(is.na(total_despeses),
+                        des_dietes_manutencio+des_allotjament+des_transport+des_altres,
+                        total_despeses)
+  ) %>% 
+  mutate(despesa_per_dia = total_despeses / durada_viatge) %>% 
+  filter(total_despeses != 0)
+```
+
+
+## 3.6. Any de naixament / edat
+
+S'ha recuperat manualment l'any de naixament per a totes les persones i es calcula l'edat de naixement en el moment de realitzar el viatge.
+
+```{r}
+# Extreure l'any de la data d'inici
+df_viatges$any_data_inici <- as.numeric(format(df_viatges$data_inici_v, "%Y"))
+
+# Calcular l'edat
+df_viatges$edat_v <- df_viatges$any_data_inici - as.numeric(df_viatges$any_naix)
+```
+
+
+No es mostren diferències de comportament de despesa per edat.
+
+```{r}
+ggplot(df_viatges, aes(x = edat_v, y = despesa_per_dia)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) + 
+  labs(title = "Relació entre Edat i Despesa per Dia",
+       x = "Edat (anys)",
+       y = "Despesa per Dia (€)")
+```
+
+
+
+
+# 4. Anàlisi dades
+
+## 4.1. Despesa per gènere
+
+```{r}
+gp_genere <- df_viatges %>%
+  group_by(sexe) %>%
+  summarise(
+    n_viatges = n(),
+    despesa_mitjana_per_dia = mean(despesa_per_dia, na.rm = TRUE),
+    despesa_mediana_per_dia = median(despesa_per_dia, na.rm = TRUE),
+    desviacio_estandard = sd(despesa_per_dia, na.rm = TRUE),
+    despesa_minima = min(despesa_per_dia, na.rm = TRUE),
+    despesa_maxima = max(despesa_per_dia, na.rm = TRUE)
+  ) %>%
+  arrange(desc(despesa_mitjana_per_dia))
+```
+
+```{r}
+ggplot(gp_genere, aes(x = sexe, y = despesa_mitjana_per_dia, fill = sexe)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = paste0("€", round(despesa_mitjana_per_dia, 2))), 
+            vjust = -0.5, size = 4, fontface = "bold") +
+  labs(
+    title = "Despesa mitjana per dia segons el gènere",
+    subtitle = paste0("Basada en ", sum(gp_genere$n_viatges), " viatges"),
+    x = "Gènere",
+    y = "Despesa mitjana per dia (€)",
+    fill = "Gènere"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 12, face = "bold"),
+    legend.position = "none"
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+```
+
+
+## 4.2. Despesa per departament
+
+```{r}
+gp_departament <- df_viatges %>%
+  group_by(nom_oficial_departament) %>%
+  summarise(media_despesa = mean(despesa_per_dia, na.rm = TRUE)) %>%
+  arrange(desc(media_despesa))
+
+# Crear el gráfico
+ggplot(gp_departament, aes(x = reorder(nom_oficial_departament, media_despesa), 
+                       y = media_despesa)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +  # Para hacer las barras horizontales y facilitar la lectura de los nombres
+  labs(
+    title = "Despesa mitjana per dia per departament",
+    subtitle = "De major a menor",
+    x = "Departament",
+    y = "Mitjana despesa per dia (€)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  ) +
+  geom_text(aes(label = round(media_despesa, 2)), 
+            hjust = -0.1, size = 3.5, color = "black")
+```
+
+
+
+## 4.3. Percentatge sobre el total
+
+```{r}
+# Calcular els percentatges per cada tipus de despesa
+gp_sobre_total <- df_viatges %>%
+  mutate(
+    pct_dietes = (des_dietes_manutencio / total_despeses) * 100,
+    pct_allotjament = (des_allotjament / total_despeses) * 100,
+    pct_transport = (des_transport / total_despeses) * 100,
+    pct_altres = (des_altres / total_despeses) * 100
+  )
+
+# Resum per departament
+resum_dept <- gp_sobre_total %>%
+  group_by(nom_oficial_departament) %>%
+  summarise(
+    pct_mitjà_dietes = mean(pct_dietes, na.rm = TRUE),
+    pct_mitjà_allotjament = mean(pct_allotjament, na.rm = TRUE),
+    pct_mitjà_transport = mean(pct_transport, na.rm = TRUE),
+    pct_mitjà_altres = mean(pct_altres, na.rm = TRUE),
+    n_casos = n()
+  ) %>%
+  mutate(across(where(is.numeric), round, 0))
+```
+
+
+## 4.4.  Destinacions més cares
+
+```{r}
+gp_despeses_pais <- df_viatges %>%
+  group_by(pais) %>%
+  summarise(
+    despesa_mitjana = mean(total_despeses, na.rm = TRUE),
+    durada_total = sum(durada_viatge, na.rm = TRUE),
+    n_viatges = n(),
+    
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(despesa_mitjana))
+
+```
+
+
+## 4.5. Despesa segons departament i sexe
+
+```{r}
+resum_dept_sexe <- df_viatges %>%
+  filter(nom_oficial_departament != "Altres/Diversos") %>% 
+  group_by(nom_oficial_departament, sexe) %>%
+  summarise(
+    despesa_mitjana = mean(total_despeses, na.rm = TRUE),
+    despesa_mediana = median(total_despeses, na.rm = TRUE),
+    despesa_sd = sd(total_despeses, na.rm = TRUE),
+    n_viatges = n(),
+    .groups = 'drop'
+  ) %>%
+  arrange(nom_oficial_departament, sexe) %>%
+  mutate(across(where(is.numeric), round, 2))
+```
+
+
+
+```{r}
+# Calcular diferència per grup i ordenar
+diferencies <- resum_dept_sexe %>%
+  group_by(nom_oficial_departament) %>% 
+  summarise(diferencia = abs(diff(despesa_mitjana))) %>%
+  arrange(desc(diferencia))
+
+# Ordenar el dataframe original
+resum_ordenat <- resum_dept_sexe %>%
+  mutate(departament = factor(nom_oficial_departament, levels = diferencies$nom_oficial_departament))
+
+# Gràfic
+ggplot(resum_ordenat, aes(x = departament, y = despesa_mitjana, fill = sexe)) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+# Preparar les dades
+df_viatges_prep <- df_viatges %>%
+  # Convertir la data al format correcte
+  mutate(data_inici_v = as.Date(data_inici_v, format = "%d/%m/%Y")) %>%
+  # Extreure mes i any
+  mutate(
+    mes = month(data_inici_v),
+    any = year(data_inici_v),
+    mes_any = floor_date(data_inici_v, "month")
+  ) %>%
+  # Calcular la despesa mitjana per mes i any
+  group_by(mes_any, any, mes) %>%
+  summarise(
+    despesa_mitjana_diaria = mean(despesa_per_dia, na.rm = TRUE),
+    durada_total = sum(durada_viatge),
+    .groups = 'drop'
+  ) %>%
+  # Crear etiqueta per l'eix X
+  mutate(etiqueta_mes = paste0(str_pad(mes, 2, pad = "0"), "/", any))
+```
+
+## 4.6. Persones més cares
+
+
+```{r}
+gp_despeses_persona <- df_viatges %>%
+  group_by(nom_cognoms) %>%
+  summarise(
+    despesa_mitjana = mean(total_despeses, na.rm = TRUE),
+    desepesa_total = sum(total_despeses, na.rm = TRUE), 
+    tota_dies = sum(durada_viatge, na.rm = TRUE), 
+    n_viatges = n(),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(despesa_mitjana))
+
+```
